@@ -1,0 +1,317 @@
+"""
+肝纤维化无创预测模型开发与验证框架
+代码包含：数据预处理 → 特征工程 → 模型训练 → 可解释分析 → Web部署
+适用：慢性丙型肝炎患者纤维化分期预测(F0-F4)
+"""
+
+import numpy as np
+import pandas as pd
+import shap
+import xgboost as xgb
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.metrics import roc_auc_score, confusion_matrix, classification_report
+from sklearn.preprocessing import RobustScaler, OneHotEncoder
+from sklearn.impute import KNNImputer
+from sklearn.compose import ColumnTransformer
+from flask import Flask, request, jsonify
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ======================== 数据准备 ========================
+def load_and_preprocess(data_path):
+    """
+    数据加载与预处理
+    输入: CSV文件路径
+    返回: 预处理后的DataFrame
+    """
+    df = pd.read_csv(data_path)
+    
+    # 1. 元数据处理
+    meta_info = {
+        'total_samples': len(df),
+        'features': list(df.columns),
+        'outcome_distribution': df['Fibrosis_Stage'].value_counts(normalize=True).to_dict()
+    }
+    
+    # 2. 缺失值处理
+    imputer = KNNImputer(n_neighbors=5)
+    num_cols = ['Age', 'ALT', 'AST', 'Platelets', 'Albumin', 'INR']
+    df[num_cols] = imputer.fit_transform(df[num_cols])
+    
+    # 3. 特征工程
+    df['APRI'] = (df['AST'] / df['AST_ULN']) / df['Platelets'] * 100
+    df['FIB4'] = (df['Age'] * df['AST']) / (df['Platelets'] * np.sqrt(df['ALT']))
+    
+    # 4. 标签编码
+    stage_mapping = {'F0':0, 'F1':1, 'F2':2, 'F3':3, 'F4':4}
+    df['Fibrosis_Stage'] = df['Fibrosis_Stage'].map(stage_mapping)
+    
+    return df, meta_info
+
+# ======================== 特征工程 ========================
+def feature_engineering(df):
+    """
+    特征工程与转换
+    """
+    # 1. 定义特征类型
+    numerical_features = ['Age', 'ALT', 'AST', 'Platelets', 'Albumin', 'INR', 'APRI', 'FIB4']
+    categorical_features = ['Gender', 'Diabetes_Status', 'HIV_Coinfection']
+    
+    # 2. 预处理管道
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', RobustScaler(), numerical_features),
+            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+        ])
+    
+    # 3. 分割数据集
+    X = df.drop('Fibrosis_Stage', axis=1)
+    y = df['Fibrosis_Stage']
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+    
+    # 4. 应用转换
+    X_train_trans = preprocessor.fit_transform(X_train)
+    X_test_trans = preprocessor.transform(X_test)
+    
+    # 获取特征名称
+    feature_names = numerical_features + \
+        list(preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_features))
+    
+    return X_train_trans, X_test_trans, y_train, y_test, feature_names, preprocessor
+
+# ======================== 模型训练 ========================
+def train_model(X_train, y_train):
+    """
+    训练XGBoost多分类模型
+    """
+    # 1. 定义模型
+    model = xgb.XGBClassifier(
+        objective='multi:softprob',
+        n_estimators=1000,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.7,
+        random_state=42,
+        tree_method='hist'
+    )
+    
+    # 2. 交叉验证调参
+    param_grid = {
+        'max_depth': [4, 6, 8],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'subsample': [0.7, 0.8, 0.9]
+    }
+    
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    grid_search = GridSearchCV(
+        estimator=model,
+        param_grid=param_grid,
+        scoring='roc_auc_ovr',
+        cv=cv,
+        verbose=1,
+        n_jobs=-1
+    )
+    
+    grid_search.fit(X_train, y_train)
+    
+    # 3. 最佳模型
+    best_model = grid_search.best_estimator_
+    print(f"最佳参数: {grid_search.best_params_}")
+    print(f"最佳交叉验证AUC: {grid_search.best_score_:.4f}")
+    
+    return best_model
+
+# ======================== 模型评估 ========================
+def evaluate_model(model, X_test, y_test):
+    """
+    模型性能评估
+    """
+    # 1. 预测结果
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)
+    
+    # 2. 多分类AUC
+    auc_ovr = roc_auc_score(
+        pd.get_dummies(y_test), 
+        y_proba, 
+        multi_class='ovr'
+    )
+    
+    # 3. 混淆矩阵
+    cm = confusion_matrix(y_test, y_pred)
+    
+    # 4. 分类报告
+    report = classification_report(
+        y_test, 
+        y_pred, 
+        target_names=['F0', 'F1', 'F2', 'F3', 'F4']
+    )
+    
+    # 5. F1分数（按类别加权）
+    f1_weighted = f1_score(y_test, y_pred, average='weighted')
+    
+    return {
+        'auc_ovr': auc_ovr,
+        'confusion_matrix': cm,
+        'classification_report': report,
+        'f1_weighted': f1_weighted
+    }
+
+# ======================== SHAP可解释性 ========================
+def explain_model(model, X_train, X_test, feature_names):
+    """
+    SHAP模型解释
+    """
+    # 1. 初始化解释器
+    explainer = shap.TreeExplainer(model)
+    
+    # 2. 全局解释
+    shap_values_train = explainer.shap_values(X_train)
+    shap_values_test = explainer.shap_values(X_test)
+    
+    # 3. 可视化
+    plt.figure(figsize=(12, 8))
+    shap.summary_plot(
+        shap_values_train, 
+        X_train, 
+        feature_names=feature_names,
+        plot_type='bar',
+        show=False
+    )
+    plt.savefig('shap_global.png', bbox_inches='tight')
+    plt.close()
+    
+    # 4. 个体解释（示例）
+    sample_idx = 42
+    plt.figure(figsize=(10, 6))
+    shap.force_plot(
+        explainer.expected_value[0],
+        shap_values_test[0][sample_idx],
+        X_test[sample_idx],
+        feature_names=feature_names,
+        show=False,
+        matplotlib=True
+    )
+    plt.savefig('shap_individual.png', bbox_inches='tight')
+    plt.close()
+    
+    return {
+        'shap_values_train': shap_values_train,
+        'shap_values_test': shap_values_test,
+        'expected_value': explainer.expected_value
+    }
+
+# ======================== 患者聚类 ========================
+def patient_clustering(X, shap_values):
+    """
+    基于SHAP值的患者聚类
+    """
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.manifold import TSNE
+    
+    # 1. 准备特征矩阵 (SHAP值 + 原始特征)
+    cluster_features = np.concatenate((shap_values, X), axis=1)
+    
+    # 2. 降维可视化
+    tsne = TSNE(n_components=2, random_state=42)
+    cluster_2d = tsne.fit_transform(cluster_features)
+    
+    # 3. 层次聚类
+    clustering = AgglomerativeClustering(n_clusters=3, linkage='ward')
+    cluster_labels = clustering.fit_predict(cluster_features)
+    
+    # 4. 可视化
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(cluster_2d[:, 0], cluster_2d[:, 1], c=cluster_labels, cmap='viridis')
+    plt.colorbar(scatter)
+    plt.title('Patient Clustering Based on SHAP Values')
+    plt.savefig('patient_clusters.png', bbox_inches='tight')
+    plt.close()
+    
+    return cluster_labels, cluster_2d
+
+# ======================== 模型部署 ========================
+def deploy_model(model, preprocessor):
+    """
+    使用Flask部署预测API
+    """
+    app = Flask(__name__)
+    
+    # 保存预处理和模型
+    joblib.dump(preprocessor, 'fibrosis_preprocessor.joblib')
+    joblib.dump(model, 'fibrosis_model.joblib')
+    
+    @app.route('/predict', methods=['POST'])
+    def predict():
+        # 1. 获取输入数据
+        data = request.json
+        input_df = pd.DataFrame([data])
+        
+        # 2. 预处理
+        preprocessor = joblib.load('fibrosis_preprocessor.joblib')
+        processed_data = preprocessor.transform(input_df)
+        
+        # 3. 预测
+        model = joblib.load('fibrosis_model.joblib')
+        probabilities = model.predict_proba(processed_data)[0]
+        
+        # 4. 返回结果
+        stages = ['F0', 'F1', 'F2', 'F3', 'F4']
+        response = {
+            'predictions': dict(zip(stages, probabilities)),
+            'interpretation': explain_prediction(processed_data, model)
+        }
+        
+        return jsonify(response)
+    
+    def explain_prediction(X, model):
+        """生成个体预测解释"""
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X)
+        
+        # 选择最重要的3个特征
+        feature_impacts = np.abs(shap_values[0]).mean(0)
+        top_idx = np.argsort(feature_impacts)[::-1][:3]
+        top_features = [feature_names[i] for i in top_idx]
+        
+        return {
+            'top_features': top_features,
+            'shap_values': shap_values[0][0].tolist(),
+            'expected_value': explainer.expected_value[0]
+        }
+    
+    return app
+
+# ======================== 主执行流程 ========================
+if __name__ == "__main__":
+    # 1. 加载数据
+    data_path = "hcv_fibrosis_data.csv"
+    df, meta_info = load_and_preprocess(data_path)
+    print(f"数据集加载完成，样本数: {meta_info['total_samples']}")
+    
+    # 2. 特征工程
+    X_train, X_test, y_train, y_test, feature_names, preprocessor = feature_engineering(df)
+    
+    # 3. 模型训练
+    print("开始模型训练...")
+    model = train_model(X_train, y_train)
+    
+    # 4. 模型评估
+    evaluation = evaluate_model(model, X_test, y_test)
+    print(f"测试集AUC: {evaluation['auc_ovr']:.4f}")
+    print(f"加权F1分数: {evaluation['f1_weighted']:.4f}")
+    
+    # 5. 可解释性分析
+    shap_results = explain_model(model, X_train[:1000], X_test[:100], feature_names)
+    
+    # 6. 患者聚类
+    cluster_labels, cluster_2d = patient_clustering(X_train[:500], shap_results['shap_values_train'][:500])
+    
+    # 7. 部署模型
+    app = deploy_model(model, preprocessor)
+    app.run(host='0.0.0.0', port=5000, debug=False)
