@@ -1,5 +1,5 @@
 """
-肝纤维化无创预测模型开发与验证框架
+Chronic HCV Fibrosis Prediction Engine
 代码包含：数据预处理 → 特征工程 → 模型训练 → 可解释分析 → Web部署
 适用：慢性丙型肝炎患者纤维化分期预测(F0-F4)
 """
